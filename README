@@ -1,0 +1,51 @@
+GitSwitch
+=========
+
+Hubs operate at layer one; switches operate at layer two.
+
+The Git SCM is inherently decentralized, but authorization solutions have been
+less decentralized, usually creating single points of failure prone to DDoS by
+script kiddies.
+
+GitSwitch is a proof of concept that shows how macaroons could be used to
+provide authorization for Git repositories.  Macaroons are the ideal
+authorization tool for git, because they can be shared in much the same way
+that git allows code to be shared.  A user with read rights to a repository
+can always share those rights with someone else simply by pulling/pushing  the
+code periodically for others.  With GitSwitch, direct sharing is possible.
+Further, it's possible to share on a per-branch basis; a caveat can be added
+allowing a user push access to just a single branch of the repository, which
+is great for providing time-limited access (great for one-off push or pull
+requests).
+
+Here are the features that are implemented:
+
+ - Clone repositories over the gitswitch:// protocol.  If the git* programs in
+   this repo are in your path, the following should prompt for macaroons for
+   the request.
+
+    git clone gitswitch://localhost:8080/some-repo
+
+ - Example caveats:
+
+    # to limit a macaroon to just one repo
+    gitswitch-repo: some-repo
+
+    # to limit actions to just cloning
+    gitswitch-service: upload-pack
+
+    # to limit actions to just pushing
+    gitswitch-service: receive-pack
+
+    # just the master branch:
+    gitswitch-head: master
+
+    # just the v0.1 tag:
+    gitswitch-tag: v0.1
+
+    # expiration of macaroons (valid through the end of 2015)
+    gitswitch-expires: 2016-01-01T00:00:00
+
+The code is not intended to be run by anyone not willing to develop it
+further; instead, it is a reading exercise for those looking to learn more
+about best practices with macaroons.

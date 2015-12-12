@@ -1,0 +1,305 @@
+#!/usr/bin/env python3
+
+# Copyright (c) 2015, Robert Escriva
+# All rights reserved.
+#
+# Redistribution and use in source and binary forms, with or without
+# modification, are permitted provided that the following conditions are met:
+#
+#     * Redistributions of source code must retain the above copyright notice,
+#       this list of conditions and the following disclaimer.
+#     * Redistributions in binary form must reproduce the above copyright
+#       notice, this list of conditions and the following disclaimer in the
+#       documentation and/or other materials provided with the distribution.
+#     * Neither the name of GitSwitch nor the names of its contributors may be
+#       used to endorse or promote products derived from this software without
+#       specific prior written permission.
+#
+# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+# AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+# IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+# DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE LIABLE
+# FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+# DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+# SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+# CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+# OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+# OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+import base64
+import datetime
+import functools
+import os
+import os.path
+import subprocess
+import re
+import sys
+import tempfile
+from subprocess import check_call
+from urllib.parse import urlparse
+from urllib.parse import urlunparse
+from urllib.parse import urlunsplit
+
+from flask import Flask
+from flask import Response
+from flask import request
+
+import macaroons
+import gitswitch
+
+GITSWITCH_HOST = 'localhost:8080'
+GITSWITCH_BASE = sys.argv[1]
+
+app = Flask('gitswitch')
+
+def fork_response(args, headers=None, stdin=None,
+                  header=None, footer=None,
+                  cwd=None, env=None):
+    env = env or {}
+    headers = headers or []
+    p = subprocess.Popen(args, cwd=cwd, env=env, close_fds=True,
+                         stdin=subprocess.PIPE,
+                         stdout=subprocess.PIPE,
+                         stderr=sys.stdout)
+    if stdin:
+        p.stdin.write(stdin)
+    p.stdin.close()
+    def gen():
+        if header:
+            yield header
+        while True:
+            data = p.stdout.read(4096)
+            if data:
+                yield data
+            else:
+                break
+        p.wait()
+        if footer:
+            yield footer
+    return Response(gen(), headers=headers)
+
+def parse_packets(data):
+    while data:
+        if data.startswith(b'0000'):
+            break
+        length = int(data[:4], 16)
+        packet = data[4:length]
+        yield packet
+        data = data[length:]
+
+def parse_receive_pack_refs(data):
+    for packet in parse_packets(data):
+        ref1 = packet[0:40]
+        ref2 = packet[41:81]
+        name = packet[82:].split(b'\x00')[0]
+        yield (ref1, ref2, name)
+
+def is_repo(repo):
+    if repo in gitswitch.BLACKLISTED_NAMES:
+        return False
+    for prefix in gitswitch.BLACKLISTED_NAMES:
+        if repo.startswith(prefix + '/'):
+            return False
+    for suffix in gitswitch.BLACKLISTED_SUFFIXES:
+        if repo.endswith(suffix):
+            return False
+    return True
+
+def repo_path(repo):
+    # XXX this is unsafe because of path traversal attacks
+    return os.path.join(GITSWITCH_BASE, 'repos', repo)
+
+def require_authorization():
+    return Response('unauthorized access', 401,
+            {'WWW-Authenticate': 'Basic realm="Login Required"'})
+
+def requires_macaroons(f):
+    @functools.wraps(f)
+    def decorated(*args, **kwargs):
+        auth = request.authorization
+        if not auth or auth.username != 'macaroons':
+            return require_authorization()
+        request.macaroons = []
+        try:
+            for m in auth.password.split(','):
+                m = macaroons.deserialize(m.encode('utf8'))
+                request.macaroons.append(m)
+        except macaroons.MacaroonError:
+            return require_authorization()
+        return f(*args, **kwargs)
+    return decorated
+
+def select_macaroon(repo):
+    global GITSWITCH_HOST
+    url = urlunsplit(('gitswitch', GITSWITCH_HOST, '/' + repo, '', ''))
+    url = url.encode('utf8')
+    for m in request.macaroons:
+        if m.location == url:
+            return m
+    return None
+
+def base_verifier(repo, service):
+    verifier = macaroons.Verifier()
+    verifier.satisfy_exact(b'gitswitch-repo: ' + repo.encode('utf8'))
+    verifier.satisfy_exact(b'gitswitch-service: ' + service.encode('utf8'))
+    verifier.satisfy_general(expires_caveat_check)
+    return verifier
+
+def repo_refs(path, reftype):
+    refs_path = os.path.join(path, 'refs', reftype)
+    refs = []
+    for root, dirs, files in os.walk(refs_path):
+        for f in files:
+            refs.append(os.path.relpath(os.path.join(root, f), refs_path))
+    return refs
+
+def get_secret(sid):
+    try:
+        sid = sid.decode('utf8')
+        if not re.match('^[a-zA-Z0-9]+$', sid):
+            return None
+        path = os.path.join(GITSWITCH_BASE, 'secrets', sid)
+        data = open(path, 'rb').read().strip()
+        return base64.urlsafe_b64decode(data)
+    except Exception as e:
+        return None
+
+class RefCaveatChecker(object):
+
+    def __init__(self):
+        self.reftype = 'head'
+        self.ref = None
+
+    def __call__(self, caveat):
+        reftype = self.reftype
+        ref = self.ref
+        if type(reftype) is str:
+            reftype = reftype.encode('utf8')
+        if type(ref) is str:
+            ref = ref.encode('utf8')
+        if ref is None:
+            return caveat.startswith(b'gitswitch-head: ') or caveat.startswith(b'gitswitch-tag: ')
+        return caveat == reftype + b': ' + ref
+
+def expires_caveat_check(caveat):
+    if not caveat.startswith(b'gitswitch-expires: '):
+        return False
+    caveat = caveat[len(b'gitswitch-expires: '):]
+    caveat = caveat.decode('utf8', 'ignore')
+    expires = datetime.datetime.strptime(caveat, '%Y-%m-%dT%H:%M:%S')
+    return datetime.datetime.utcnow() < expires
+
+def create_restricted_repo(repo, service):
+    '''returns (repo_path, response)
+    One is guaranteed to be None.  If response is not None, then it is an error
+    to return.  If repo_path is not None, then it is the path of the restricted
+    repository'''
+    verifier = base_verifier(repo, service)
+    rcc = RefCaveatChecker()
+    verifier.satisfy_general(rcc)
+    M = select_macaroon(repo)
+    path = repo_path(repo)
+    secret = get_secret(M.identifier)
+    valid = verifier.verify_unsafe(M, secret, MS=request.macaroons)
+    valid = valid and service in ('upload-pack', 'receive-pack')
+    valid = valid and os.path.exists(path)
+    if not valid:
+        return None, require_authorization()
+    all_heads = repo_refs(path, 'heads')
+    all_tags = repo_refs(path, 'tags')
+    selected_heads = set()
+    selected_tags = set()
+    for head in all_heads:
+        rcc.reftype = 'head'
+        rcc.ref = head
+        if verifier.verify_unsafe(M, secret, MS=request.macaroons):
+            selected_heads.add(head)
+    for tag in all_tags:
+        rcc.reftype = 'tag'
+        rcc.ref = tag
+        if verifier.verify_unsafe(M, secret, MS=request.macaroons):
+            selected_tags.add(tag)
+    if not selected_heads:
+        return None, require_authorization()
+    r = tempfile.mkdtemp(prefix='tmp-info-refs-', dir=GITSWITCH_BASE)
+    check_call(('git', 'init', '--bare', r),
+               stdout=subprocess.PIPE,
+               stderr=subprocess.STDOUT)
+    for head in selected_heads:
+        check_call(('git', 'fetch', path, 'refs/heads/' + head), cwd=r,
+                   stdout=subprocess.PIPE,
+                   stderr=subprocess.STDOUT)
+        check_call(('git', 'branch', head, 'FETCH_HEAD'), cwd=r,
+                   stdout=subprocess.PIPE,
+                   stderr=subprocess.STDOUT)
+    for tag in selected_tags:
+        check_call(('git', 'fetch', path, 'refs/tags/' + tag), cwd=r,
+                   stdout=subprocess.PIPE,
+                   stderr=subprocess.STDOUT)
+        check_call(('git', 'tag', tag, 'FETCH_HEAD'), cwd=r,
+                   stdout=subprocess.PIPE,
+                   stderr=subprocess.STDOUT)
+    return r, None
+
+@app.route('/<path:repo>' + gitswitch.INFO_REFS)
+@requires_macaroons
+def info_refs(repo):
+    service = request.args['service']
+    service = service.lstrip('git-')
+    path, response = create_restricted_repo(repo, service)
+    if response is not None:
+        return response
+    headers = [
+        ('Content-Type', 'application/x-git-{0}-advertisement'.format(service)),
+    ] + gitswitch.NO_CACHE_HEADERS
+    header = ''
+    if service == 'upload-pack':
+        header = '001e# service=git-upload-pack\n0000'
+    if service == 'receive-pack':
+        header = '001f# service=git-receive-pack\n0000'
+    args = ['git', service, '--stateless-rpc', '--advertise-refs', '.']
+    return fork_response(args, headers=headers, header=header, cwd=path)
+
+@app.route('/<path:repo>' + gitswitch.UPLOAD_PACK, methods=['POST'])
+@requires_macaroons
+def upload_pack(repo):
+    path, response = create_restricted_repo(repo, 'upload-pack')
+    if response is not None:
+        return response
+    headers = [
+        ('Content-Type', 'application/x-git-upload-pack-result'),
+    ] + gitswitch.NO_CACHE_HEADERS
+    args = ['git', 'upload-pack', '--stateless-rpc', '.']
+    return fork_response(args, headers=headers, stdin=request.data, cwd=path)
+
+@app.route('/<path:repo>' + gitswitch.RECEIVE_PACK, methods=['POST'])
+@requires_macaroons
+def receive_pack(repo):
+    verifier = base_verifier(repo, 'receive-pack')
+    M = select_macaroon(repo)
+    path = repo_path(repo)
+    secret = get_secret(M.identifier)
+    valid = verifier.verify_unsafe(M, secret, MS=request.macaroons)
+    valid = valid and os.path.exists(path)
+    if not valid:
+        return require_authorization()
+    rcc = RefCaveatChecker()
+    verifier.satisfy_general(rcc)
+    for ref1, ref2, name in parse_receive_pack_refs(request.data):
+        if name.startswith(b'refs/heads/'):
+            rcc.reftype = 'head'
+            rcc.ref = name[len(b'refs/heads/'):]
+        elif name.startswith(b'refs/tags/'):
+            rcc.reftype = 'tag'
+            rcc.ref = name[len(b'refs/tags/'):]
+        else:
+            return require_authorization()
+        if not verifier.verify_unsafe(M, secret, MS=request.macaroons):
+            return require_authorization()
+    headers = [
+        ('Content-Type', 'application/x-git-receive-pack-result')
+    ] + gitswitch.NO_CACHE_HEADERS
+    args = ['git', 'receive-pack', '--stateless-rpc', '.']
+    return fork_response(args, headers=headers, stdin=request.data, cwd=path)
+
+app.run(host='127.0.0.1',port=8080, threaded=True, debug=True)

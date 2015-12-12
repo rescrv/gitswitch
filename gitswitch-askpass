@@ -1,0 +1,98 @@
+#!/usr/bin/env python3
+
+# Copyright (c) 2015, Robert Escriva
+# All rights reserved.
+#
+# Redistribution and use in source and binary forms, with or without
+# modification, are permitted provided that the following conditions are met:
+#
+#     * Redistributions of source code must retain the above copyright notice,
+#       this list of conditions and the following disclaimer.
+#     * Redistributions in binary form must reproduce the above copyright
+#       notice, this list of conditions and the following disclaimer in the
+#       documentation and/or other materials provided with the distribution.
+#     * Neither the name of GitSwitch nor the names of its contributors may be
+#       used to endorse or promote products derived from this software without
+#       specific prior written permission.
+#
+# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+# AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+# IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+# DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE LIABLE
+# FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+# DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+# SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+# CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+# OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+# OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+# This askpass program provides to git's curl-based helpers a username of
+# "macaroons", and a set of macaroons for the request.  It's intended only for
+# use from within git-remote-gitswitch.
+
+import datetime
+import os
+import os.path
+import sys
+
+import macaroons
+
+if len(sys.argv) == 2:
+    arg = sys.argv[1].lower()
+    if arg.startswith('username'):
+        print('macaroons')
+    elif arg.startswith('password'):
+        if 'GIT_DIR' not in os.environ:
+            sys.exit(1)
+        path = os.path.join(os.environ['GIT_DIR'], 'gitswitch', 'macaroons')
+        stdout = open('/dev/tty', 'w')
+        stderr = open('/dev/tty', 'w')
+        if not os.path.exists(path):
+            stdin = open('/dev/tty', 'r')
+            if not os.path.exists(os.path.dirname(path)):
+                os.makedirs(os.path.dirname(path))
+            f = open(path, 'wb')
+            stdout.write('need macaroons for authorization\n')
+            stdout.write('enter one macaroon per line\n')
+            while True:
+                x = stdin.readline().strip()
+                if not x:
+                    break
+                try:
+                    m = macaroons.deserialize(x.encode('utf8'))
+                    f.write(m.serialize() + b'\n')
+                except macaroons.MacaroonError as e:
+                    stderr.write('invalid macaroon; aborting\n')
+                    sys.exit(1)
+            f.flush()
+            f.close()
+        f = open(path, 'rb')
+        primary = None
+        ms = []
+        url = os.environ.get('GITSWITCH_URL', None)
+        if url is not None:
+            url = url.encode('utf8', 'ignore')
+        for m in f:
+            try:
+                m = macaroons.deserialize(m)
+                expiry = datetime.datetime.utcnow() + datetime.timedelta(seconds=10)
+                m = m.add_first_party_caveat(b'gitswitch-expires: ' + expiry.strftime('%Y-%m-%dT%H:%M:%S').encode('utf8'))
+                if m.location == url:
+                    if primary is None:
+                        primary = m
+                else:
+                    ms.append(m)
+            except macaroons.MacaroonError as e:
+                stderr.write('invalid macaroon in stored macaroons file; skipping')
+        if primary is not None:
+            ms = [primary.prepare_for_request(m) for m in ms]
+            ms = [primary] + ms
+        password = b','.join([m.serialize() for m in ms])
+        sys.stdout.write(password.decode('utf8') + '\n')
+    else:
+        print("gitswitch doesn't know how to interact with this version of git", file=sys.stderr)
+        print("unknown prompt was: ", sys.argv[1], file=sys.stderr)
+        sys.exit(1)
+    sys.exit(0)
+else:
+    sys.exit(1)
